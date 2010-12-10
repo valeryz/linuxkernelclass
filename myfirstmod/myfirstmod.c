@@ -2,6 +2,12 @@
  * My first Linux kernel module. Mostly c/p from skeleton :)
  *
  * In its /proc entry it outputs the number of ms it has been loaded
+ * If you write a '0' to the file, it will stop counting jiffies.
+ * If you then write a '1', it will reset the counter and resume counting.
+ *
+ * I wonder if there's even a theoretical race problem between toggling the
+ * `counting' flag and resetting the jiffies counter to the latest value. IMO
+ * there is one. See comment in write_proc().
  *
  */
 
@@ -13,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/jiffies.h>
 #include <linux/compiler.h>
+#include <linux/uaccess.h>
 
 #ifndef CONFIG_PROC_FS
 #error Enable procfs support in kernel
@@ -26,6 +33,8 @@
 static struct proc_dir_entry *proc_dir;
 static struct proc_dir_entry *proc_info;
 static unsigned long load_jiffies;
+static unsigned long stopped_jiffies;
+static int now_counting;
 
 #ifdef DEBUG
 static unsigned int debug_level = 0;
@@ -46,11 +55,54 @@ module_param(debug_level, uint, S_IRUGO|S_IWUSR);
 static int read_proc(char *page, char **start, off_t off,
 		     int count, int *eof, void *data)
 {
-	unsigned long diff = jiffies - load_jiffies;
-	int n = snprintf(page, count,
-			 "The moudle has been loaded for %lu jiffies\n", diff);
+	unsigned long diff;
+	int n;
+
+	if (now_counting) {
+		diff = jiffies - load_jiffies;
+	} else {
+		diff = stopped_jiffies - load_jiffies;
+	}
+	n = snprintf(page, count,
+		     "The moudle has been loaded for %lu jiffies\n", diff);
 	*eof = 1;
-	return n;
+	return (n);
+}
+
+static int write_proc(struct file *file, const char __user *buffer,
+		      unsigned long count, void *data)
+{
+	char inp;
+
+	if (count <= 0)
+		return (count);
+
+	if (copy_from_user(&inp, buffer, sizeof(inp)) == 0) {
+		if (inp == '1') {
+			load_jiffies = jiffies;
+			/*
+			 * preemption here creates a race (?), I mean one
+			 * process might write, then get preempted here, then
+			 * another one would write to the same file. But who
+			 * cares, we are just counting jiffies ...
+			 *
+			 * Because we update `load_jiffies' _before_ the flag,
+			 * it should be fine as long as updates are not
+			 * reordered, so we might need a memory barrier here?
+			 */
+			now_counting = 1;
+			DBG(0, KERN_INFO, "enabling jiffies counting\n");
+		} else if (inp == '0') {
+			stopped_jiffies = jiffies;
+			/* same here about preeption at this point */
+			now_counting = 0;
+			DBG(0, KERN_INFO, "disabling jiffies counting\n");
+		} else {
+			DBG(0, KERN_INFO, "don't understand\n");
+		}
+	}
+
+	return (count);		/* as if we've read up everything */
 }
 
 static int __init setup_procfs_entry(void)
@@ -70,6 +122,7 @@ static int __init setup_procfs_entry(void)
 	}
 
 	proc_info->read_proc = read_proc;
+	proc_info->write_proc = write_proc;
 	proc_info->data = NULL;
 
 	return (0);
@@ -81,6 +134,7 @@ static int __init myfirstmod_init(void)
 		return (-1);
 
 	load_jiffies = jiffies;
+	now_counting = 1;
 
 	DBG(2, KERN_INFO, "myfirstmod loaded\n");
 	return (0);
