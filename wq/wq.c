@@ -6,29 +6,23 @@
  * A very dumb abbreviated alternative implementation of the work queues
  */
 
-#include <linux/init.h>
+#include <linux/init.h> 
 #include <linux/module.h>
-#include <linux/proc_fs.h>
 #include <linux/stat.h>
 #include <linux/printk.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/err.h>
+#include <linux/kthread.h>
 #include <linux/jiffies.h>
 #include <linux/compiler.h>
-#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/cpumask.h>
-
-#ifndef CONFIG_PROC_FS
-#error Enable procfs support in kernel
-#endif
+#include <linux/freezer.h>
+#include <linux/sched.h>
 
 #define MY_MOD_NAME "wq"
-
-static struct proc_dir_entry *proc_dir;
-static struct proc_dir_entry *proc_info;
-
 
 #ifdef DEBUG
 static unsigned int debug_level = 0;
@@ -46,155 +40,188 @@ module_param(debug_level, uint, S_IRUGO|S_IWUSR);
 #define DBG(...)
 #endif
 
-static LIST_HEAD(workqueues);
-
+/* list of work items, which consistitues a work queue */
 struct work_item
 {
 	void (*task)(unsigned long data);
 	unsigned long data;
-	struct list_head *list;
+	struct list_head list;
 };
 
+/* work queues */
 struct wq {
-	struct list_head *wq_list;
-	struct list_head *work_items;
-	struct mutex wq_lock;
+	struct list_head wq_list;
+	struct list_head work_items;
 };
 
-static wait_queue_head_t wq_global_waitq;
+/* global list of work queues */
+static LIST_HEAD(work_queues);
 
+/* all synchronization is done via a single global spin lock */
+DEFINE_SPINLOCK(work_queues_lock);
+
+/* worker threads wait using this wait queue */
+DECLARE_WAIT_QUEUE_HEAD(worker_waitq);
+
+/* default wait queue */
 static struct wq *default_wq;
-static struct task_struct *worker_threads;
 
-/*
- * TODO: worker threads shall wait on a global wait queue, no
- * wait queues for a given 'work queue'
- */
+/* array of worker threads, there will be as many threads as there are CPUs */
+static struct task_struct **worker_threads;
 
 struct wq *wq_create(void)
 {
-	struct wq *new_wq = kcalloc(1, sizeof(*new_wq), GPF_KERNEL);
+	struct wq *new_wq = kcalloc(1, sizeof(*new_wq), GFP_KERNEL);
 	if (unlikely(new_wq == NULL))
 		return ERR_PTR(-ENOMEM);
 
-	INIT_LIST_HEAD(new_wq->work_items);
-	mutex_init(&new_wq->wq_lock);
+	INIT_LIST_HEAD(&new_wq->work_items);
 
-	/* TODO: add item to the list (syncrhonized - rcu?) */
-	list_add(new_wq->wq_list, workqueues);
+	spin_lock(&work_queues_lock);
+	list_add(&new_wq->wq_list, &work_queues);
+	spin_unlock(&work_queues_lock);
 
-	init_waitqueue_head(&new_wq->waitq);
 	return new_wq;
 }
-EXPORT_SYMBOL(create_wq);
+EXPORT_SYMBOL(wq_create);
 
 void wq_destroy(struct wq *wq)
 {
-	/* TODO: synchronization */
-
-	/* destroy all work items in the queue */
-	mutex_lock(&wq->wq_lock);
-
-	while (!list_empty(wq->work_items)) {
+	spin_lock(&work_queues_lock);
+	while (!list_empty(&wq->work_items)) {
 		/* the work will never be done, ignore it */
-		struct work_item *wi = list_entry(wq->work_items,
-						  work_item, list);
-		list_del(wq->work_items);
+		struct work_item *wi = list_entry(&wq->work_items,
+						  struct work_item, list);
+		list_del(&wq->work_items);
 		kfree(wi);
 	}
-
-	list_del(wq->wq_list);
-
-	mutex_unlock(&wq->wq_lock);
+	list_del(&wq->wq_list);
+	spin_unlock(&work_queues_lock);
 	kfree(wq);
 }
-EXPORT_SYMBOL(destroy_wq);
+EXPORT_SYMBOL(wq_destroy);
 
 int wq_add_delayed_work(struct wq *wq, void (*task)(unsigned long data),
 			unsigned long data, unsigned long delay)
 {
-	struct work_item *wi = kcalloc(1, sizeof(*wi), GPF_KERNEL);
+	struct work_item *wi = kcalloc(1, sizeof(*wi), GFP_KERNEL);
 
 	/* TODO: handle delay, ignoring for now */
 	(void)delay;
-	
+
 	if (unlikely(wi == NULL))
 		return -ENOMEM;
 
 	wi->task = task;
 	wi->data = data;
-	mutex_lock(&wq->wq_lock);
-	list_add(wi->list, wq->work_items);
-	mutex_unlock(&wq->wq_lock);
-	wake_up(&wq->waitq);
+	spin_lock(&work_queues_lock);
+	list_add(&wi->list, &wq->work_items);
+	spin_unlock(&work_queues_lock);
+	wake_up(&worker_waitq);
 	return 0;
 }
-EXPORT_SYMBOL(wq_add_work_timeout);
+EXPORT_SYMBOL(wq_add_delayed_work);
 
 int wq_add_work(struct wq *wq, void (*task)(unsigned long data),
 		unsigned long data)
 {
-	return wq_add_work_timeout(wq, task, data, 0);
+	if (wq == NULL)
+		wq = default_wq;
+	return wq_add_delayed_work(wq, task, data, 0);
 }
 EXPORT_SYMBOL(wq_add_work);
 
-static int read_proc(char *page, char **start, off_t off,
-		     int count, int *eof, void *data)
+/*
+ * look for a work item, and if one is found, return it
+ */
+static struct work_item *find_work(void)
 {
-	unsigned long diff;
-	int n;
-
-	n = snprintf(page, count, "Work Queue module");
-	*eof = 1;
-	return (n);
+	struct work_item *wi = NULL;
+	struct wq *wq = list_first_entry(&work_queues, struct wq, wq_list);
+	if (wq) {
+		wi = list_first_entry(&wq->work_items, struct work_item, list);
+		/* next time start from the next queue */
+		list_rotate_left(&work_queues);
+	}
+	return wi;
 }
 
-static int __init setup_procfs_entry(void)
+static int worker_thread_fn(void *data)
 {
-	proc_dir = proc_mkdir(MY_MOD_NAME, NULL);
-	if (unlikely(!proc_dir)) {
-		printk(KERN_ERR "unable to create /proc/%s\n", MY_MOD_NAME);
-		return (-1);
+	struct work_item *wi = NULL;
+
+	(void)data;
+
+	DBG(2, KERN_DEBUG, "New thread started: pid %d, comm %s\n",
+	    current->pid, current->comm);
+
+	/* Allow the thread to be frozen */
+	set_freezable();
+
+	for (;;) {
+		DEFINE_WAIT(wait);
+
+		/* do all work that we can get */
+		while (wi) {
+			/* do rest of the work w/o sleeping */
+			DBG(0, KERN_DEBUG, "Doing work: %p", wi->task);
+			(*wi->task)(wi->data);
+
+			if (kthread_should_stop())
+				return 0;
+
+			try_to_freeze();
+
+			spin_lock(&work_queues_lock);
+			wi = find_work();
+			spin_unlock(&work_queues_lock);
+		}
+
+		/* now there's no work, so we must wait until something
+		   arrives */
+		while (!wi) {
+			prepare_to_wait_exclusive(&worker_waitq, &wait,
+						  TASK_INTERRUPTIBLE);
+
+			if (kthread_should_stop())
+				return 0;
+
+			if (try_to_freeze())
+				continue;
+
+			spin_lock(&work_queues_lock);
+			wi = find_work();
+			spin_unlock(&work_queues_lock);
+			if (!wi)
+				schedule();
+		}
+		finish_wait(&worker_waitq, &wait);
 	}
 
-	proc_info = create_proc_read_entry(MY_MOD_NAME, S_IRUGO, proc_dir,
-					   read_proc, NULL);
-	if (unlikely(!proc_info)) {
-		printk(KERN_ERR "cannot create proc entry\n");
-		remove_proc_entry(MY_MOD_NAME, NULL);
-		return (-1);
-	}
-
-	proc_info->read_proc = read_proc;
-	proc_info->data = NULL;
-
-	return (0);
+	return 0;
 }
 
 static int __init wq_init(void)
 {
 	int err;
 	int cpu;
-	
-	if (unlikely(setup_procfs_entry() == -1))
-		return (-1);
 
-	/* TODO: create default work queue */
+	/* create default work queue */
 	default_wq = wq_create();
 	if (IS_ERR(default_wq))
 		return PTR_ERR(default_wq);
 
 	/* spawn as many threads as necessary */
 	worker_threads = kcalloc(nr_cpu_ids, sizeof(*worker_threads),
-				 GPF_KERNEL);
+				 GFP_KERNEL);
 	if (worker_threads == NULL) {
 		err = -ENOMEM;
 		goto err;
 	}
 
 	for (cpu=0; cpu < nr_cpu_ids; cpu++) {
-		worker_threads[cpu] = kthread_create(worker_thread, NULL,
-						   "wq_worker/%d", cpu);
+		worker_threads[cpu] = kthread_create(worker_thread_fn, NULL,
+						     "wq_worker/%d", cpu);
 		if (IS_ERR(worker_threads[cpu])) {
 			err = PTR_ERR(worker_threads[cpu]);
 			goto err;
@@ -202,8 +229,8 @@ static int __init wq_init(void)
 	}
 
 	for (cpu=0; cpu < nr_cpu_ids; cpu++) {
-		kthread_bind(worker_thread[cpu], cpu);
-		wake_up_process(worker_thread[cpu]);
+		kthread_bind(worker_threads[cpu], cpu);
+		wake_up_process(worker_threads[cpu]);
 	}
 
 	DBG(2, KERN_INFO, "wq loaded\n");
@@ -212,23 +239,32 @@ static int __init wq_init(void)
 
 err:
 	if (worker_threads) {
-		
-		kthread_stop(
+		/* it cost me half a day to really learn that you don't have
+		 * to free tasks_struct's resulting from kthread_create */
+		kfree(worker_threads);
 	}
-	return err;
-}
+	if (default_wq)
+		wq_destroy(default_wq);
 
-static void __exit cleanup_procfs_entry(void)
-{
-	if (likely(proc_info))
-		remove_proc_entry(MY_MOD_NAME, proc_dir);
-	if (likely(proc_dir))
-		remove_proc_entry(MY_MOD_NAME, NULL);
+	return err;
 }
 
 static void __exit wq_exit(void)
 {
-	cleanup_procfs_entry();
+	int cpu;
+
+	for (cpu=0; cpu < nr_cpu_ids; cpu++) {
+		(void)kthread_stop(worker_threads[cpu]);
+	}
+
+	spin_lock(&work_queues_lock);
+	while (!list_empty(&work_queues)) {
+		struct wq *wq = list_entry(&work_queues, struct wq, wq_list);
+		list_del(&work_queues);
+		wq_destroy(wq);
+	}
+	spin_unlock(&work_queues_lock);
+	
 	DBG(2, KERN_INFO, "wq unloaded\n");
 }
 
