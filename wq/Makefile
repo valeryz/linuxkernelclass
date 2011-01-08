@@ -1,4 +1,4 @@
-obj-m         := myfirstmod.o
+obj-m         := wq.o
 
 ARCH          := x86_64
 CROSS_COMPILE :=
