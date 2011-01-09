@@ -21,8 +21,11 @@
 #include <linux/cpumask.h>
 #include <linux/freezer.h>
 #include <linux/sched.h>
+#include <linux/printk.h>
 
 #define MY_MOD_NAME "wq"
+
+#define DEBUG
 
 #ifdef DEBUG
 static unsigned int debug_level = 0;
@@ -31,7 +34,7 @@ module_param(debug_level, uint, S_IRUGO|S_IWUSR);
 #define DBG(level, kern_level, fmt, ...)				 \
 	do {								 \
 		if (level <= debug_level) {				 \
-			printk(kern_level (MY_MOD_NAME "[%s:%u]: ") fmt, \
+			printk(kern_level MY_MOD_NAME "[%s:%u]: " fmt,   \
 			       __func__, __LINE__,			 \
 			       ## __VA_ARGS__);				 \
 		}							 \
@@ -137,9 +140,14 @@ EXPORT_SYMBOL(wq_add_work);
 static struct work_item *find_work(void)
 {
 	struct work_item *wi = NULL;
-	struct wq *wq = list_first_entry(&work_queues, struct wq, wq_list);
-	if (wq) {
-		wi = list_first_entry(&wq->work_items, struct work_item, list);
+	struct wq *wq;
+	if (!list_empty(&work_queues)) {
+		wq = list_first_entry(&work_queues, struct wq, wq_list);
+		if (!list_empty(&wq->work_items)) {
+			wi = list_first_entry(&wq->work_items,
+					      struct work_item, list);
+			list_del(&wq->work_items);
+		}
 		/* next time start from the next queue */
 		list_rotate_left(&work_queues);
 	}
@@ -211,10 +219,8 @@ static int __init wq_init(void)
 	if (IS_ERR(default_wq))
 		return PTR_ERR(default_wq);
 
-	/* spawn as many threads as necessary */
-	worker_threads = kcalloc(nr_cpu_ids, sizeof(*worker_threads),
-				 GFP_KERNEL);
-	if (worker_threads == NULL) {
+	worker_threads = kcalloc(1, sizeof(*worker_threads), GFP_KERNEL);
+	if (!worker_threads) {
 		err = -ENOMEM;
 		goto err;
 	}
@@ -235,14 +241,14 @@ static int __init wq_init(void)
 
 	DBG(2, KERN_INFO, "wq loaded\n");
 
-	return (0);
+	return 0;
 
 err:
-	if (worker_threads) {
-		/* it cost me half a day to really learn that you don't have
-		 * to free tasks_struct's resulting from kthread_create */
+	/* it cost me half a day to really learn that you don't have
+	 * to free tasks_struct's resulting from kthread_create */
+	if (worker_threads)
 		kfree(worker_threads);
-	}
+
 	if (default_wq)
 		wq_destroy(default_wq);
 
@@ -253,15 +259,19 @@ static void __exit wq_exit(void)
 {
 	int cpu;
 
-	for (cpu=0; cpu < nr_cpu_ids; cpu++) {
-		(void)kthread_stop(worker_threads[cpu]);
+	if (worker_threads) {
+		for (cpu=0; cpu < nr_cpu_ids; cpu++) {
+			(void)kthread_stop(worker_threads[cpu]);
+		}
 	}
 
 	spin_lock(&work_queues_lock);
 	while (!list_empty(&work_queues)) {
 		struct wq *wq = list_entry(&work_queues, struct wq, wq_list);
 		list_del(&work_queues);
+		spin_unlock(&work_queues_lock);
 		wq_destroy(wq);
+		spin_lock(&work_queues_lock);
 	}
 	spin_unlock(&work_queues_lock);
 	
