@@ -20,6 +20,7 @@
 
 #define MY_MOD_NAME "netdev"
 
+#define DEBUG
 
 struct net_device *nd;
 
@@ -30,7 +31,7 @@ module_param(debug_level, uint, S_IRUGO|S_IWUSR);
 #define DBG(level, kern_level, fmt, ...)				 \
 	do {								 \
 		if (level <= debug_level) {				 \
-			printk(kern_level (MY_MOD_NAME "[%s:%u]: ") fmt, \
+			printk(kern_level MY_MOD_NAME "[%s:%u]: " fmt,   \
 			       __func__, __LINE__,			 \
 			       ## __VA_ARGS__);				 \
 		}							 \
@@ -46,6 +47,8 @@ int netdev_open(struct net_device *dev)
 
 	/* memcpy(dev->dev_addr, mymacaddr, ETH_ALEN); */
 
+	DBG(0, KERN_INFO, "starting %s device", dev->name);
+
 	netif_start_queue(dev);
 
 	return 0;
@@ -53,6 +56,7 @@ int netdev_open(struct net_device *dev)
 
 int netdev_stop(struct net_device *dev)
 {
+	DBG(0, KERN_INFO, "stopping %s device", dev->name);
 	netif_stop_queue(dev);
 	return 0;
 }
@@ -64,6 +68,7 @@ netdev_tx_t netdev_start_xmit(struct sk_buff *skb,
 	if (skb->protocol == htons(ETH_P_ARP)) {
 		DBG(0, KERN_INFO, "Got an ARP packet");
 		/* get the ARP IP Address */
+
 
 	}
 	/* rest packets are siltently dropped */
