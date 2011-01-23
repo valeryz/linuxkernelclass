@@ -43,7 +43,7 @@ module_param(debug_level, uint, S_IRUGO|S_IWUSR);
 #define DBG(level, kern_level, fmt, ...)				 \
 	do {								 \
 		if (level <= debug_level) {				 \
-			printk(kern_level (MY_MOD_NAME "[%s:%u]: ") fmt, \
+			printk(kern_level MY_MOD_NAME "[%s:%u]: " fmt,   \
 			       __func__, __LINE__,			 \
 			       ## __VA_ARGS__);				 \
 		}							 \
