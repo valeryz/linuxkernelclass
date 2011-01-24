@@ -4,8 +4,6 @@
 
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/proc_fs.h>
-#include <linux/stat.h>
 #include <linux/printk.h>
 #include <linux/kernel.h>
 #include <linux/compiler.h>
@@ -13,10 +11,6 @@
 #include <linux/if_ether.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
-
-#ifndef CONFIG_PROC_FS
-#error Enable procfs support in kernel
-#endif
 
 #define MY_MOD_NAME "netdev"
 
